@@ -3,6 +3,8 @@ on: [push, workflow_dispatch]
 jobs:
   windows:
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -15,10 +17,6 @@ jobs:
         shell: bash
       - run: cp README.txt dist/MotionCapture/ ; ls dist/MotionCapture
         shell: bash
-      - uses: actions/upload-artifact@v4
-        with:
-          name: MotionCapture-Windows
-          path: dist/MotionCapture
       - name: zip
         run: Compress-Archive -Path dist/MotionCapture -DestinationPath MotionCapture-Windows.zip
         shell: pwsh
@@ -26,3 +24,8 @@ jobs:
         with:
           name: MotionCapture-Windows-zip
           path: MotionCapture-Windows.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: MotionCapture-Windows.zip
+          tag_name: v${{ github.run_number }}
+          name: Windows Build ${{ github.run_number }}

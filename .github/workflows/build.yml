@@ -1,0 +1,27 @@
+name: build-windows
+on: [push, workflow_dispatch]
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install playwright pyinstaller
+      - run: playwright install chromium
+        shell: bash
+      - run: pyinstaller --name MotionCapture --onedir --collect-all playwright --add-data "queue.txt;." --hidden-import asyncio capture_browser.py
+        shell: bash
+      - run: cp "README.txt" dist/MotionCapture/ ; ls dist/MotionCapture
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MotionCapture-Windows
+          path: dist/MotionCapture
+      - name: zip
+        run: Compress-Archive -Path dist/MotionCapture -DestinationPath MotionCapture-Windows.zip
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MotionCapture-Windows-zip
+          path: MotionCapture-Windows.zip

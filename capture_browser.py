@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
-"""Annotator capture browser (v1 core).
+"""Annotator capture browser — annotator types the URL each launch.
 
-A headed Chromium the annotator browses in. Every media asset the page actually
-loads is captured from the browser's own network layer (real bytes, no cert / no
-proxy / no re-fetch), content-addressed and deduped into a local store, with a
-manifest attributing each asset to the site it came from. A floating panel acts
-as the work queue (site N/total, Next button, live captured count). A background
-thread mirrors new assets to a central target (local copy is always kept).
+Each launch: prompt for a URL, open it, capture every media asset the page
+loads. To keep the browser snappy we do NOT pull bytes through Chrome's CDP
+(await resp.body() slows the browser); instead we record asset URLs as the page
+loads and a background thread re-fetches them with requests. Stored under
+sessions/<seq>_<host>/. Closing the browser ends that site. No UI injected.
 
-Test (no window, drives itself through the queue):
-    CAP_HEADLESS=1 CAP_AUTOTEST=1 python3 capture_browser.py --queue q.txt --store ~/asset_capture
-Real use (annotator window):
-    python3 capture_browser.py --queue q.txt --store ~/asset_capture
+Test (self-drive, headless):
+    CAP_HEADLESS=1 CAP_AUTOTEST=1 CAP_URL=https://midu.design/ \
+        python3 capture_browser.py --store /tmp/cap
+Real use:
+    python3 capture_browser.py --store ~/asset_capture
 """
 import argparse
 import asyncio
 import hashlib
 import json
 import os
+import queue
 import re
+import socket
 import sys
-import time
+import threading
 from urllib.parse import urlparse
+
+import requests
 
 MEDIA_EXT = {
     "image": {"jpg", "jpeg", "png", "webp", "avif", "gif", "svg", "bmp", "ico"},
@@ -30,13 +34,15 @@ MEDIA_EXT = {
     "model": {"glb", "gltf", "drc", "ktx2", "usdz", "fbx", "obj", "ply"},
     "lottie": {"lottie"},
 }
-MAX_BYTES = 60 * 1024 * 1024  # human-paced, so allow bigger than the batch's 30MB
+MAX_BYTES = 60 * 1024 * 1024
 
-# never store media requested from these hosts (privacy: analytics/social/auth/pay)
 BLOCK_HOSTS = ("google", "gstatic", "googleapis", "doubleclick", "recaptcha",
                "facebook", "instagram", "twitter", "x.com", "tiktok", "linkedin",
                "paypal", "alipay", "mail.", "accounts.", "login.", "analytics",
                "sentry", "hotjar", "segment")
+
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 
 def ext_of(url):
@@ -62,36 +68,55 @@ def classify(url, ct):
     return None
 
 
-PANEL_JS = r"""
-() => {
-  if (window.__capPanel) return;
-  const d = document.createElement('div');
-  d.id = '__capPanel'; window.__capPanel = d;
-  d.style.cssText = 'position:fixed;z-index:2147483647;right:14px;bottom:14px;'
-    + 'background:#111;color:#eee;font:12px/1.4 -apple-system,sans-serif;'
-    + 'padding:10px 12px;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.4);'
-    + 'min-width:180px;opacity:.92';
-  d.innerHTML = '<div id="__capInfo">采集中…</div>'
-    + '<div style="margin-top:6px;display:flex;gap:6px">'
-    + '<button id="__capNext" style="flex:1;padding:5px;border:0;border-radius:6px;'
-    + 'background:#3b82f6;color:#fff;cursor:pointer">下一个 ▶</button></div>';
-  document.body.appendChild(d);
-  d.querySelector('#__capNext').onclick = () => window.__capNext && window.__capNext();
-}
-"""
-
-
 class Capture:
-    def __init__(self, store, upload_target):
-        self.assets = os.path.join(store, "assets")
-        self.manifest = os.path.join(store, "manifest.jsonl")
+    """Records asset URLs from the browser (cheap) and downloads them in a
+    background thread (keeps the browser responsive)."""
+
+    def __init__(self, sess_dir, site):
+        self.site = site
+        self.assets = os.path.join(sess_dir, "assets")
+        self.manifest = os.path.join(sess_dir, "manifest.json")
         os.makedirs(self.assets, exist_ok=True)
         self.seen_url = set()
         self.seen_sha = set()
         self.count = 0
         self.bytes = 0
-        self.current_site = None
+        self._q = queue.Queue()
         self._mf = open(self.manifest, "a", encoding="utf-8")
+        self._sess = requests.Session()
+        self._sess.headers.update({"User-Agent": UA})
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                break
+            url, host, ct, kind = item
+            try:
+                r = self._sess.get(url, timeout=(10, 20),
+                                   headers={"Referer": self.site})
+                if r.status_code != 200:
+                    continue
+                body = r.content
+                if not body or len(body) > MAX_BYTES:
+                    continue
+                sha = hashlib.sha256(body).hexdigest()
+                e = ext_of(url) or (ct.split("/")[-1].split(";")[0] or "bin")
+                if sha not in self.seen_sha:
+                    self.seen_sha.add(sha)
+                    with open(os.path.join(self.assets, "%s.%s" % (sha, e[:5])), "wb") as f:
+                        f.write(body)
+                self.count += 1
+                self.bytes += len(body)
+                self._mf.write(json.dumps({
+                    "site": self.site, "url": url, "host": host,
+                    "type": kind, "sha": sha, "bytes": len(body),
+                }, ensure_ascii=False) + "\n")
+                self._mf.flush()
+            except Exception:
+                pass
 
     async def on_response(self, resp):
         try:
@@ -108,54 +133,62 @@ class Capture:
             if url in self.seen_url:
                 return
             self.seen_url.add(url)
-            cl = int(resp.headers.get("content-length") or 0)
-            if cl and cl > MAX_BYTES:
-                return
-            body = await resp.body()
-            if not body or len(body) > MAX_BYTES:
-                return
-            sha = hashlib.sha256(body).hexdigest()
-            e = ext_of(url) or (ct.split("/")[-1].split(";")[0] or "bin")
-            if sha not in self.seen_sha:
-                self.seen_sha.add(sha)
-                fp = os.path.join(self.assets, "%s.%s" % (sha, e[:5]))
-                if not os.path.exists(fp):
-                    with open(fp, "wb") as f:
-                        f.write(body)
-            self.count += 1
-            self.bytes += len(body)
-            self._mf.write(json.dumps({
-                "site": self.current_site, "url": url, "host": host,
-                "type": kind, "sha": sha, "bytes": len(body),
-            }, ensure_ascii=False) + "\n")
-            self._mf.flush()
+            self._q.put((url, host, ct, kind))   # background fetch, no CDP body
         except Exception:
             pass
 
+    def stop(self, timeout=120):
+        self._q.put(None)
+        self._thread.join(timeout=timeout)
 
-async def run(queue, store, headless, autotest, upload_target):
+
+def default_store():
+    if getattr(sys, "frozen", False):
+        host = socket.gethostname().split(".")[0]
+        return os.path.join(os.path.expanduser("~/Desktop"), "motion_capture_%s" % host)
+    return os.path.expanduser("~/asset_capture")
+
+
+def next_seq(store):
+    d = os.path.join(store, "sessions")
+    os.makedirs(d, exist_ok=True)
+    nums = []
+    for name in os.listdir(d):
+        base = name.split("_", 1)[0]
+        if base.isdigit():
+            nums.append(int(base))
+    return (max(nums) + 1) if nums else 1
+
+
+async def run(url, store, headless, autotest):
     from playwright.async_api import async_playwright
-    urls = [l.strip() for l in open(queue, encoding="utf-8") if l.strip()]
-    progress_path = os.path.join(store, "progress.json")
-    done = set()
-    if os.path.exists(progress_path):
-        try:
-            done = set(json.load(open(progress_path)).get("done", []))
-        except Exception:
-            pass
-    todo = [u for u in urls if u not in done]
-    print("[cap] queue %d | remaining %d" % (len(urls), len(todo)), file=sys.stderr)
+    host = urlparse(url).netloc.replace(":", "_").replace("/", "_") or "site"
+    seq = next_seq(store)
+    sess = os.path.join(store, "sessions", "%05d_%s" % (seq, host))
+    os.makedirs(os.path.join(sess, "assets"), exist_ok=True)
 
-    cap = Capture(store, upload_target)
-    idx = {"i": 0}
+    print("=" * 56, file=sys.stderr)
+    print(" 第 %d 条" % seq, file=sys.stderr)
+    print(" 正在打开: %s" % url, file=sys.stderr)
+    print(" 素材存到: %s" % sess, file=sys.stderr)
+    print(" 看完直接关掉浏览器窗口即可。", file=sys.stderr)
+    print("=" * 56, file=sys.stderr)
+
+    cap = Capture(sess, url)
+    closed = asyncio.Event()
 
     async def launch_ctx(p):
         profile = os.path.join(store, "_profile")
         last = None
         for ch in ("chrome", "msedge", None):
             try:
-                kw = dict(headless=headless, viewport={"width": 1440, "height": 900},
-                          accept_downloads=True, args=["--disable-dev-shm-usage"])
+                kw = dict(
+                    headless=headless, viewport={"width": 1440, "height": 900},
+                    accept_downloads=True,
+                    ignore_default_args=["--enable-automation"],
+                    args=["--disable-blink-features=AutomationControlled",
+                          "--no-sandbox", "--disable-dev-shm-usage"],
+                )
                 if ch:
                     kw["channel"] = ch
                 ctx = await p.chromium.launch_persistent_context(profile, **kw)
@@ -168,109 +201,68 @@ async def run(queue, store, headless, autotest, upload_target):
     async with async_playwright() as p:
         ctx = await launch_ctx(p)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        page.on("response", lambda r: asyncio.create_task(cap.on_response(r)))
 
-        async def goto_idx():
-            if idx["i"] >= len(todo):
-                print("[cap] queue done", file=sys.stderr)
-                return False
-            cap.current_site = todo[idx["i"]]
-            try:
-                await page.goto(cap.current_site, wait_until="domcontentloaded", timeout=45000)
-            except Exception as e:
-                print("[cap] goto %s: %s" % (cap.current_site, str(e)[:70]), file=sys.stderr)
-            return True
+        def on_page_close():
+            if closed.is_set():
+                return
+            loop = asyncio.get_event_loop()
+            loop.call_later(0.4, lambda: closed.set() if not ctx.pages else None)
 
-        async def next_site():
-            done.add(todo[idx["i"]])
-            json.dump({"done": sorted(done)}, open(progress_path, "w"))
-            idx["i"] += 1
-            await goto_idx()
-            await refresh_panel()
+        def attach(p):
+            p.on("response", lambda r: asyncio.create_task(cap.on_response(r)))
+            p.on("close", on_page_close)
 
-        async def refresh_panel():
-            try:
-                await page.evaluate(PANEL_JS)
-                info = "站 %d/%d · 已采 %d 个 · %.1fMB" % (
-                    idx["i"] + 1, len(todo), cap.count, cap.bytes / 1e6)
-                await page.evaluate("(t)=>{const e=document.getElementById('__capInfo');if(e)e.textContent=t;}", info)
-            except Exception:
-                pass
-
-        await ctx.expose_binding("__capNext", lambda source: asyncio.create_task(next_site()))
-        await goto_idx()
-        await refresh_panel()
+        attach(page)
+        ctx.on("page", attach)
+        ctx.on("close", lambda: closed.set())
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        except Exception as e:
+            print("[cap] 打开站点失败: %s" % str(e)[:90], file=sys.stderr)
 
         if autotest:
-            # self-drive: scroll each site, advance, prove capture works
-            for _ in range(min(2, len(todo))):
-                for _s in range(6):
-                    try:
-                        await page.mouse.wheel(0, 4000)
-                    except Exception:
-                        break
-                    await asyncio.sleep(0.6)
-                await asyncio.sleep(2)
-                await next_site()
-            print("[cap] AUTOTEST captured %d assets, %.1fMB" % (cap.count, cap.bytes / 1e6), file=sys.stderr)
+            await asyncio.sleep(4)
+            await page.close()
+        else:
+            await closed.wait()
+        try:
             await ctx.close()
-            return
+        except Exception:
+            pass
 
-        # real use: keep the window open; refresh panel periodically
-        while True:
-            await asyncio.sleep(3)
-            await refresh_panel()
-
-
-def default_store():
-    import socket
-    if getattr(sys, "frozen", False):
-        host = socket.gethostname().split(".")[0]
-        return os.path.join(os.path.expanduser("~/Desktop"), "motion_capture_%s" % host)
-    return os.path.expanduser("~/asset_capture")
-
-
-def resolve_queue(arg):
-    if arg and os.path.exists(arg):
-        return arg
-    exedir = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
-                             else os.path.abspath(__file__))
-    cands = [os.path.join(exedir, "queue.txt")]
-    if hasattr(sys, "_MEIPASS"):
-        cands.append(os.path.join(sys._MEIPASS, "queue.txt"))
-    for c in cands:
-        if os.path.exists(c):
-            return c
-    return None
+    print("[cap] 正在保存剩余素材…", file=sys.stderr)
+    cap.stop()
+    print("[cap] 本条完成:采集 %d 个素材, %.1fMB" % (cap.count, cap.bytes / 1e6), file=sys.stderr)
+    print("[cap] 素材已保存到: %s" % sess, file=sys.stderr)
+    print("[cap] 在桌面「motion_capture」文件夹里,每条一个子文件夹。", file=sys.stderr)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--queue", default=None)
     ap.add_argument("--store", default=None)
-    ap.add_argument("--upload-target", default=os.environ.get("CAP_UPLOAD", ""))
+    ap.add_argument("--url", default=None, help="skip the prompt, use this URL (testing)")
     args = ap.parse_args()
     headless = os.environ.get("CAP_HEADLESS") == "1"
     autotest = os.environ.get("CAP_AUTOTEST") == "1"
 
     store = args.store or default_store()
     os.makedirs(store, exist_ok=True)
-    queue = resolve_queue(args.queue)
-    if not queue:
-        print("找不到 queue.txt(要看的网站清单),请把 queue.txt 放到程序同一个文件夹。", file=sys.stderr)
-        sys.exit(2)
 
-    print("=" * 56, file=sys.stderr)
-    print(" 素材采集器已启动", file=sys.stderr)
-    print(" 采集文件存放在: %s" % store, file=sys.stderr)
-    print(" 完成后把这个文件夹整个压缩发回即可。", file=sys.stderr)
-    print("=" * 56, file=sys.stderr)
-    asyncio.run(run(queue, store, headless, autotest, args.upload_target))
-
-
-if __name__ == "__main__":
-    main()
-
+    if args.url:
+        url = args.url.strip()
+    elif autotest:
+        url = os.environ.get("CAP_URL", "").strip()
+    else:
+        try:
+            url = input("请输入要采集的网站地址(例如 www.example.com),然后回车: ").strip()
+        except EOFError:
+            url = ""
+    if not url:
+        print("未输入网址,退出。", file=sys.stderr)
+        sys.exit(0)
+    if not re.match(r"^https?://", url, re.I):
+        url = "http://" + url
+    asyncio.run(run(url, store, headless, autotest))
 
 
 if __name__ == "__main__":

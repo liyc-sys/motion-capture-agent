@@ -7,12 +7,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
-      - run: pip install playwright pyinstaller
+      - run: pip install playwright pyinstaller requests
+        shell: bash
       - run: playwright install chromium
         shell: bash
-      - run: pyinstaller --name MotionCapture --onedir --collect-all playwright --add-data "queue.txt;." --hidden-import asyncio capture_browser.py
+      - run: pyinstaller --name MotionCapture --onedir --collect-all playwright --collect-all requests --hidden-import asyncio capture_browser.py
         shell: bash
-      - run: cp "README.txt" dist/MotionCapture/ ; ls dist/MotionCapture
+      - run: cp README.txt dist/MotionCapture/ ; ls dist/MotionCapture
         shell: bash
       - uses: actions/upload-artifact@v4
         with:

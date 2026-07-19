@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Annotator capture browser — annotator types the URL each launch.
 
-Each launch: prompt for a URL, open it, capture every media asset the page
-loads. To keep the browser snappy we do NOT pull bytes through Chrome's CDP
-(await resp.body() slows the browser); instead we record asset URLs as the page
-loads and a background thread re-fetches them with requests. Stored under
-sessions/<seq>_<host>/. Closing the browser ends that site. No UI injected.
+Browse-time is ZERO-download: we only record asset URLs as the page loads, so
+the annotator's bandwidth is untouched (no lag on click / no frozen video
+backgrounds). After the browser window is closed, all recorded assets are
+downloaded with a visible progress counter, and a DONE.txt flag is written into
+the session folder — a session without DONE.txt means the annotator closed the
+terminal early and the capture is incomplete.
+
+Layout per session:  sessions/<seq>_<host>/assets/*  manifest.json  DONE.txt
 
 Test (self-drive, headless):
     CAP_HEADLESS=1 CAP_AUTOTEST=1 CAP_URL=https://midu.design/ \
@@ -18,11 +21,12 @@ import asyncio
 import hashlib
 import json
 import os
-import queue
 import re
 import socket
 import sys
-import threading
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 import requests
@@ -35,11 +39,20 @@ MEDIA_EXT = {
     "lottie": {"lottie"},
 }
 MAX_BYTES = 60 * 1024 * 1024
+DL_DEADLINE = 60          # per-asset wall clock cap in the post-close download
+DL_WORKERS = 6
 
 BLOCK_HOSTS = ("google", "gstatic", "googleapis", "doubleclick", "recaptcha",
                "facebook", "instagram", "twitter", "x.com", "tiktok", "linkedin",
                "paypal", "alipay", "mail.", "accounts.", "login.", "analytics",
                "sentry", "hotjar", "segment")
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -69,54 +82,19 @@ def classify(url, ct):
 
 
 class Capture:
-    """Records asset URLs from the browser (cheap) and downloads them in a
-    background thread (keeps the browser responsive)."""
+    """Browse-time: record URLs only (zero bandwidth). After close: download."""
 
     def __init__(self, sess_dir, site):
         self.site = site
+        self.sess_dir = sess_dir
         self.assets = os.path.join(sess_dir, "assets")
         self.manifest = os.path.join(sess_dir, "manifest.json")
         os.makedirs(self.assets, exist_ok=True)
+        self.pending = []
         self.seen_url = set()
         self.seen_sha = set()
         self.count = 0
         self.bytes = 0
-        self._q = queue.Queue()
-        self._mf = open(self.manifest, "a", encoding="utf-8")
-        self._sess = requests.Session()
-        self._sess.headers.update({"User-Agent": UA})
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
-
-    def _worker(self):
-        while True:
-            item = self._q.get()
-            if item is None:
-                break
-            url, host, ct, kind = item
-            try:
-                r = self._sess.get(url, timeout=(10, 20),
-                                   headers={"Referer": self.site})
-                if r.status_code != 200:
-                    continue
-                body = r.content
-                if not body or len(body) > MAX_BYTES:
-                    continue
-                sha = hashlib.sha256(body).hexdigest()
-                e = ext_of(url) or (ct.split("/")[-1].split(";")[0] or "bin")
-                if sha not in self.seen_sha:
-                    self.seen_sha.add(sha)
-                    with open(os.path.join(self.assets, "%s.%s" % (sha, e[:5])), "wb") as f:
-                        f.write(body)
-                self.count += 1
-                self.bytes += len(body)
-                self._mf.write(json.dumps({
-                    "site": self.site, "url": url, "host": host,
-                    "type": kind, "sha": sha, "bytes": len(body),
-                }, ensure_ascii=False) + "\n")
-                self._mf.flush()
-            except Exception:
-                pass
 
     async def on_response(self, resp):
         try:
@@ -133,13 +111,80 @@ class Capture:
             if url in self.seen_url:
                 return
             self.seen_url.add(url)
-            self._q.put((url, host, ct, kind))   # background fetch, no CDP body
+            self.pending.append((url, host, ct, kind))
         except Exception:
             pass
 
-    def stop(self, timeout=120):
-        self._q.put(None)
-        self._thread.join(timeout=timeout)
+    def _fetch(self, sess, item):
+        url = item[0]
+        try:
+            r = sess.get(url, timeout=(10, 25), stream=True,
+                         headers={"Referer": self.site})
+            if r.status_code != 200:
+                return None
+            cl = int(r.headers.get("content-length") or 0)
+            if cl and cl > MAX_BYTES:
+                return None
+            h = hashlib.sha256()
+            chunks = []
+            total = 0
+            t0 = time.time()
+            for chunk in r.iter_content(65536):
+                if time.time() - t0 > DL_DEADLINE:
+                    r.close()
+                    return None
+                total += len(chunk)
+                if total > MAX_BYTES:
+                    r.close()
+                    return None
+                h.update(chunk)
+                chunks.append(chunk)
+            return (item, h.hexdigest(), b"".join(chunks))
+        except Exception:
+            return None
+
+    def download_all(self):
+        total = len(self.pending)
+        if not total:
+            self._write_done()
+            return
+        print("", file=sys.stderr)
+        print("⚠️⚠️⚠️  正在下载素材(共 %d 个),请不要关闭这个窗口!  ⚠️⚠️⚠️" % total, file=sys.stderr)
+        print("      下载完成后会明确提示,并自动写入完成标志。", file=sys.stderr)
+        sess = requests.Session()
+        sess.headers.update({"User-Agent": UA})
+        done = 0
+        with ThreadPoolExecutor(max_workers=DL_WORKERS) as ex:
+            futs = [ex.submit(self._fetch, sess, it) for it in self.pending]
+            with open(self.manifest, "a", encoding="utf-8") as mf:
+                for fut in as_completed(futs):
+                    done += 1
+                    res = fut.result()
+                    if res:
+                        (url, host, ct, kind), sha, body = res
+                        e = ext_of(url) or (ct.split("/")[-1].split(";")[0] or "bin")
+                        if sha not in self.seen_sha:
+                            self.seen_sha.add(sha)
+                            fp = os.path.join(self.assets, "%s.%s" % (sha, e[:5]))
+                            if not os.path.exists(fp):
+                                with open(fp, "wb") as f:
+                                    f.write(body)
+                        self.count += 1
+                        self.bytes += len(body)
+                        mf.write(json.dumps({
+                            "site": self.site, "url": url, "host": host,
+                            "type": kind, "sha": sha, "bytes": len(body),
+                        }, ensure_ascii=False) + "\n")
+                        mf.flush()
+                    if done % 10 == 0 or done == total:
+                        print("[cap] 下载进度 %d/%d …(请勿关闭窗口)" % (done, total), file=sys.stderr)
+        self._write_done()
+
+    def _write_done(self):
+        with open(os.path.join(self.sess_dir, "DONE.txt"), "w", encoding="utf-8") as f:
+            f.write("下载完成\n站点: %s\n素材: %d 个, %.1f MB\n完成时间: %s\n"
+                    % (self.site, self.count, self.bytes / 1e6,
+                       time.strftime("%Y-%m-%d %H:%M:%S")))
 
 
 def default_store():
@@ -170,15 +215,16 @@ async def run(url, store, headless, autotest):
     print("=" * 56, file=sys.stderr)
     print(" 第 %d 条" % seq, file=sys.stderr)
     print(" 正在打开: %s" % url, file=sys.stderr)
-    print(" 素材存到: %s" % sess, file=sys.stderr)
-    print(" 看完直接关掉浏览器窗口即可。", file=sys.stderr)
+    print(" 浏览时不占网速;关掉浏览器后才开始下载素材。", file=sys.stderr)
     print("=" * 56, file=sys.stderr)
 
     cap = Capture(sess, url)
     closed = asyncio.Event()
 
     async def launch_ctx(p):
-        profile = os.path.join(store, "_profile")
+        # profile lives in the system temp dir, NOT in the store — so annotators
+        # never accidentally send back browser cache/cookies
+        profile = os.path.join(tempfile.gettempdir(), "motion_capture_profile")
         last = None
         for ch in ("chrome", "msedge", None):
             try:
@@ -230,11 +276,11 @@ async def run(url, store, headless, autotest):
         except Exception:
             pass
 
-    print("[cap] 正在保存剩余素材…", file=sys.stderr)
-    cap.stop()
-    print("[cap] 本条完成:采集 %d 个素材, %.1fMB" % (cap.count, cap.bytes / 1e6), file=sys.stderr)
-    print("[cap] 素材已保存到: %s" % sess, file=sys.stderr)
-    print("[cap] 在桌面「motion_capture」文件夹里,每条一个子文件夹。", file=sys.stderr)
+    cap.download_all()
+    print("", file=sys.stderr)
+    print("✅ 本条完成:采集 %d 个素材, %.1fMB" % (cap.count, cap.bytes / 1e6), file=sys.stderr)
+    print("✅ 素材已保存到: %s" % sess, file=sys.stderr)
+    print("✅ 已写入完成标志 DONE.txt,现在可以关闭窗口了。", file=sys.stderr)
 
 
 def main():
@@ -263,6 +309,11 @@ def main():
     if not re.match(r"^https?://", url, re.I):
         url = "http://" + url
     asyncio.run(run(url, store, headless, autotest))
+    if sys.platform == "win32" and not autotest:
+        try:
+            input("\n[cap] 按回车键关闭窗口...")
+        except EOFError:
+            pass
 
 
 if __name__ == "__main__":
